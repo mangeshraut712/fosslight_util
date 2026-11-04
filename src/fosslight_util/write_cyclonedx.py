@@ -8,6 +8,7 @@ import os
 import logging
 import re
 from pathlib import Path
+from urllib.parse import unquote
 from fosslight_util.constant import (FOSSLIGHT_BINARY, FOSSLIGHT_DEPENDENCY, FOSSLIGHT_SCANNER,
                                      FOSSLIGHT_SOURCE, LOGGER_NAME)
 import traceback
@@ -66,6 +67,56 @@ except Exception as error:
     logger.info(f'Failed to import cyclonedx-python-lib: {error}')
 
 
+class _CaseSensitiveNpmPurl(PackageURL if _cyclonedx_import_error is None else object):
+    """Preserve npm name casing required by FOSSLight's PURL writing rules."""
+
+    def to_string(self, encode=True):
+        value = PackageURL(
+            type='generic', namespace=self.namespace, name=self.name,
+            version=self.version, qualifiers=self.qualifiers, subpath=self.subpath,
+        ).to_string(encode=encode)
+        return value.replace('pkg:generic/', 'pkg:npm/', 1)
+
+
+class _OriginalPurl(PackageURL if _cyclonedx_import_error is None else object):
+    """Preserve qualifier percent-encoding (e.g., %2F of repository_url) as written."""
+
+    def __new__(cls, original='', **kwargs):
+        return super().__new__(cls, **kwargs)
+
+    def __init__(self, original='', **kwargs):
+        self._original = original
+
+    def to_string(self, encode=True):
+        return self._original
+
+
+def _parse_dependency_purl(value):
+    parsed = PackageURL.from_string(value)
+    if parsed.type == 'npm' and not parsed.qualifiers:
+        package_path = value.split('?', 1)[0].split('#', 1)[0].removeprefix('pkg:npm/')
+        # Split the version from the last path segment only, so the '@'
+        # opening an unencoded npm scope is not mistaken for a version.
+        if '@' in package_path.rsplit('/', 1)[-1]:
+            package_path = package_path.rsplit('@', 1)[0]
+        namespace = unquote(package_path.rsplit('/', 1)[0]) if '/' in package_path else None
+        name = unquote(package_path.rsplit('/', 1)[-1])
+        return _CaseSensitiveNpmPurl(
+            type=parsed.type, namespace=namespace, name=name,
+            version=parsed.version, qualifiers=parsed.qualifiers, subpath=parsed.subpath,
+            normalize_purl=False,
+        )
+    if parsed.qualifiers:
+        # PackageURL.from_string() decodes qualifier values, so serializing the
+        # parsed object would turn %2F back into '/'. Keep the source string instead.
+        return _OriginalPurl(
+            value, type=parsed.type, namespace=parsed.namespace, name=parsed.name,
+            version=parsed.version, qualifiers=parsed.qualifiers, subpath=parsed.subpath,
+            normalize_purl=False,
+        )
+    return parsed
+
+
 def write_cyclonedx(output_file_without_ext, output_extension, scan_item, scanner_covers=None):
     success = True
     error_msg = ''
@@ -119,7 +170,7 @@ def write_cyclonedx(output_file_without_ext, output_extension, scan_item, scanne
                         if oss_item.copyright != '':
                             comp.copyright = oss_item.copyright
                         if scanner_name == FOSSLIGHT_DEPENDENCY and file_item.purl:
-                            comp.purl = PackageURL.from_string(file_item.purl)
+                            comp.purl = _parse_dependency_purl(file_item.purl)
                         if scanner_name != FOSSLIGHT_DEPENDENCY:
                             if file_item.checksum != '0':
                                 comp.hashes = [HashType(alg=HashAlgorithm.SHA_1, content=file_item.checksum)]
@@ -164,11 +215,11 @@ def write_cyclonedx(output_file_without_ext, output_extension, scan_item, scanne
 
             if len(bom.components) > 0:
                 for comp_purl in relation_tree:
-                    comp = bom.get_component_by_purl(PackageURL.from_string(comp_purl))
+                    comp = bom.get_component_by_purl(_parse_dependency_purl(comp_purl))
                     if comp:
                         dep_comp_list = []
                         for dep_comp_purl in relation_tree[comp_purl]:
-                            dep_comp = bom.get_component_by_purl(PackageURL.from_string(dep_comp_purl))
+                            dep_comp = bom.get_component_by_purl(_parse_dependency_purl(dep_comp_purl))
                             if dep_comp:
                                 dep_comp_list.append(dep_comp)
                         bom.register_dependency(comp, dep_comp_list)
